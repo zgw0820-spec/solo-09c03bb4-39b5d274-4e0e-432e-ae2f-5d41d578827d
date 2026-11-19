@@ -12,6 +12,9 @@ services:
       HTTP_PORT: "9000"
       INITIAL_OFFSET_MS: "0"      # 初始源钟差（毫秒），网页可实时调整
       INITIAL_DELAY_MS: "20"      # 初始回包延迟（毫秒），网页可实时调整
+      TRACE_TTL_S: "120"          # 链路追踪记录有效期（秒），过期只报证据不足
+      TRACE_RETAIN_EXPIRED_S: "300"
+      TRACE_MAX_ENTRIES: "4096"
     ports:
       - "10123:123/udp"           # 宿主机直测口（可选）
       - "9001:9000"               # 控制口（可选暴露，便于调试）
@@ -27,6 +30,9 @@ services:
       HTTP_PORT: "9000"
       INITIAL_OFFSET_MS: "0"
       INITIAL_DELAY_MS: "20"
+      TRACE_TTL_S: "120"
+      TRACE_RETAIN_EXPIRED_S: "300"
+      TRACE_MAX_ENTRIES: "4096"
     ports:
       - "10124:123/udp"
       - "9002:9000"

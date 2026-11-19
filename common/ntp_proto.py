@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import struct
 
 # 1900-01-01 到 1970-01-01 的秒数（NTP 纪元与 Unix 纪元之差）
@@ -15,6 +16,12 @@ NTP_PACKET_SIZE = 48
 MODE_CLIENT = 3
 MODE_SERVER = 4
 VERSION = 4
+
+# 链路追踪用的请求标识：追加在 48 字节标准报文之后（NTP 扩展字段/认证区
+# 位置，标准源会忽略）。16 个 ASCII 十六进制字符，长度对齐到 16 字节的
+# 整数倍。没有该扩展的普通请求按原样处理，不影响既有探测。
+TRACE_ID_LEN = 16
+TRACE_EXT_LEN = 16
 
 # 头 4 字节 + 根延迟/根离散各 4 + 参考 ID 4 + 4 个 64 位时间戳 = 48 字节
 # B   B   b   b   I           I              4s      Q Q Q Q
@@ -40,10 +47,40 @@ def ntp_to_unix(ntp: int) -> float:
     return seconds - NTP_EPOCH_DELTA + fraction / (1 << 32)
 
 
-def build_client_packet(transmit_ntp: int) -> bytes:
-    """构造客户端请求：LI=0, VN=4, Mode=3，仅填发送时间戳。"""
+def build_client_packet(transmit_ntp: int, trace_id: str | None = None) -> bytes:
+    """构造客户端请求：LI=0, VN=4, Mode=3，仅填发送时间戳。
+
+    trace_id: 可选的 16 位十六进制请求标识；给出时追加 16 字节扩展区，
+    供源端控制口按标识登记收包/发包记录。标准 NTP 源会忽略该扩展。
+    """
     li_vn_mode = (0 << 6) | (VERSION << 3) | MODE_CLIENT
-    return _PACKET.pack(li_vn_mode, 0, 0, 0, 0, 0, b"\x00" * 4, 0, 0, 0, transmit_ntp)
+    packet = _PACKET.pack(
+        li_vn_mode, 0, 0, 0, 0, 0, b"\x00" * 4, 0, 0, 0, transmit_ntp,
+    )
+    if trace_id is not None:
+        packet += _trace_ext(trace_id)
+    return packet
+
+
+TRACE_ID_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def _trace_ext(trace_id: str) -> bytes:
+    if not TRACE_ID_RE.fullmatch(trace_id):
+        raise ValueError("trace_id 必须是 16 位小写十六进制")
+    return trace_id.encode("ascii").ljust(TRACE_EXT_LEN, b"\x00")
+
+
+def extract_trace_id(data: bytes) -> str | None:
+    """从请求报文里取请求标识；无扩展或格式不符返回 None。"""
+    if len(data) < NTP_PACKET_SIZE + TRACE_ID_LEN:
+        return None
+    raw = data[NTP_PACKET_SIZE:NTP_PACKET_SIZE + TRACE_ID_LEN]
+    try:
+        text = raw.rstrip(b"\x00").decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text if TRACE_ID_RE.fullmatch(text) else None
 
 
 def build_server_packet(

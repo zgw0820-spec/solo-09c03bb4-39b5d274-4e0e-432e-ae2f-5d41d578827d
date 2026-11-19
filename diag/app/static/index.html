@@ -46,6 +46,32 @@
   .err { color:#a40e26; font-size:13px; }
   .hidden { display:none; }
   code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+
+  /* 链路追踪 */
+  .link-card { border:1px solid var(--border); border-radius:8px;
+               padding:12px 14px; margin-top:12px; }
+  .link-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .link-head h3 { margin:0; font-size:14px; }
+  .badge { font-size:12px; font-weight:600; padding:2px 9px; border-radius:999px;
+           border:1px solid transparent; }
+  .b-sent-ok      { background:#dafbe1; color:#116329; border-color:#4ac26b; }
+  .b-recv-wait    { background:#ddf4ff; color:#0969da; border-color:#54aeff; }
+  .b-sent-lost    { background:#ffebe9; color:#a40e26; border-color:#ff8182; }
+  .b-sent-late    { background:#fff8c5; color:#7d4e00; border-color:#d4a72c; }
+  .b-no-req       { background:#ffeef8; color:#a40e26; border-color:#ff9bce; }
+  .b-insufficient { background:#eaeef2; color:#424a53; border-color:#8c959f; }
+  .link-detail { font-size:13px; margin:8px 0 0; }
+  .steps { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin-top:10px; }
+  @media (max-width:760px){ .steps{grid-template-columns:1fr 1fr;} }
+  .step { border:1px solid var(--border); border-radius:6px; padding:7px 9px; }
+  .step .k { font-size:11px; color:#57606a; }
+  .step .v { font-size:12px; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .step.yes { background:#f0fff4; border-color:#4ac26b; }
+  .step.no  { background:#fff0f0; border-color:#ff8182; }
+  .step.unk { background:#f6f8fa; }
+  .trace-meta { font-size:11px; color:#57606a; margin-top:8px; word-break:break-all; }
+  .warning { font-size:12px; color:#7d4e00; background:#fff8c5; border:1px solid #d4a72c;
+             border-radius:6px; padding:7px 10px; margin-top:9px; }
 </style>
 </head>
 <body>
@@ -84,6 +110,13 @@
     <p class="reason" id="reasonText"></p>
     <div id="sourceTables"></div>
     <p id="intersectionText" class="muted"></p>
+  </section>
+
+  <section id="traceSection" class="hidden">
+    <h2>四、链路追踪（按本轮请求标识向各源控制口核对收发记录）</h2>
+    <p class="muted">只核对本轮请求：控制口不可达、源在探测期间重启、记录过期或
+      查不到与本轮 t1 对应的记录时，一律只报“证据不足”，不据此断定网络丢包。</p>
+    <div id="traceCards"></div>
   </section>
 </main>
 
@@ -158,6 +191,96 @@ function sourceTable(s) {
     <td>[${fmt(s.interval_ms[0])}, ${fmt(s.interval_ms[1])}]</td></tr></table>`;
 }
 
+// ---- 链路追踪 ----
+
+const LINK_CLASS = {
+  source_sent_diag_received:      'b-sent-ok',
+  source_received_not_sent:       'b-recv-wait',
+  source_sent_diag_not_received:  'b-sent-lost',
+  source_sent_diag_late:          'b-sent-late',
+  source_sent_diag_invalid_reply: 'b-sent-late',
+  source_no_request:              'b-no-req',
+  insufficient_evidence:          'b-insufficient',
+};
+
+function step(label, value, cls) {
+  return `<div class="step ${cls}"><div class="k">${label}</div>
+          <div class="v">${value}</div></div>`;
+}
+
+function esc(text) {
+  return String(text ?? '').replace(/[&<>"']/g, c => (
+    { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+function linkCard(link, sourceName, roundId) {
+  const tl = link.timeline || {};
+  const sentOk = link.state === 'source_sent_diag_received';
+  const receivedBySource = tl.source_received_at != null;
+  const sentBySource = tl.source_sent_at != null;
+  // ④ 诊断机收包：成功看 t4；迟到/无效回包虽收到但被拒收；超时则确实没收到
+  let step4Value, step4Class;
+  if (sentOk) { step4Value = fmtTs(tl.diag_received_at); step4Class = 'yes'; }
+  else if (link.state === 'source_sent_diag_late') { step4Value = '收到但迟到/串包，已拒收'; step4Class = 'no'; }
+  else if (link.state === 'source_sent_diag_invalid_reply') { step4Value = '收到但回包无效'; step4Class = 'no'; }
+  else if (link.state === 'source_sent_diag_not_received') { step4Value = '超时未见'; step4Class = 'no'; }
+  else if (link.state === 'source_received_not_sent') { step4Value = '未收到（源尚未发出）'; step4Class = 'no'; }
+  else if (link.state === 'source_no_request') { step4Value = '未见（请求未到源端）'; step4Class = 'no'; }
+  else { step4Value = '未知'; step4Class = 'unk'; }
+  const steps = [
+    step('① 诊断机发出请求', fmtTs(tl.request_sent_at),
+         tl.request_sent_at != null ? 'yes' : 'unk'),
+    step('② 源端收包', fmtTs(tl.source_received_at),
+         receivedBySource ? 'yes' : (link.conclusive ? 'no' : 'unk')),
+    step('③ 源端发包', sentBySource ? fmtTs(tl.source_sent_at) : (link.conclusive ? '未见' : '未知'),
+         sentBySource ? 'yes' : (link.conclusive ? 'no' : 'unk')),
+    step('④ 诊断机收包', step4Value, step4Class),
+  ].join('');
+  const warning = link.conclusive ? '' :
+    `<div class="warning">⚠ 证据不足：${esc(link.detail)}。请重测或检查源端控制口，勿据此断定网络丢包。</div>`;
+  const meta = [
+    `请求标识 <code>${esc(link.trace_id) || '—'}</code>`,
+    `源端记录 ${esc(link.record_status) || '—'}`,
+    link.boot_before ? `启动标识 ${esc(link.boot_before.slice(0,8))}` : '启动标识 未取到',
+    link.boot_after ? `→ ${esc(link.boot_after.slice(0,8))}` : '',
+  ].filter(Boolean).join(' · ');
+  return `<div class="link-card">
+    <div class="link-head">
+      <h3>源 ${link.source_id}：${esc(sourceName)}</h3>
+      <span class="badge ${LINK_CLASS[link.state] || 'b-insufficient'}">${esc(link.label)}</span>
+      <button class="secondary" style="margin:0;padding:3px 10px;font-size:12px"
+              onclick="retrace('${esc(roundId)}', ${link.source_id}, this)">重新查询本记录</button>
+    </div>
+    <p class="link-detail">${esc(link.detail)}</p>
+    <div class="steps">${steps}</div>
+    ${warning}
+    <div class="trace-meta">${meta}</div>
+  </div>`;
+}
+
+function renderLinks(result, sourceNames) {
+  document.getElementById('traceSection').classList.remove('hidden');
+  document.getElementById('traceCards').innerHTML = (result.links || [])
+    .map(l => linkCard(l, sourceNames[l.source_id] || '—', result.round_id)).join('');
+}
+
+async function retrace(roundId, sourceId, btn) {
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '查询中…';
+  try {
+    const data = await api('/api/trace', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ round_id: roundId, source_id: sourceId }) });
+    const names = {};
+    for (const s of (window.__lastResult?.sources || [])) names[s.id] = s.name;
+    const card = btn.closest('.link-card');
+    card.outerHTML = linkCard(data, names[sourceId] || '—', roundId);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    alert('重新查询失败：' + e.message);
+  }
+}
+
 async function runDiagnose() {
   const btn = document.getElementById('diagnoseBtn');
   btn.disabled = true; btn.textContent = '探测中…';
@@ -166,6 +289,7 @@ async function runDiagnose() {
                    timeout_ms: parseInt(document.getElementById('timeout').value, 10) };
     const r = await api('/api/diagnose',
       { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    window.__lastResult = r;
     document.getElementById('resultSection').classList.remove('hidden');
     const banner = document.getElementById('verdictBanner');
     banner.className = 'banner ' + (VERDICT_CLASS[r.verdict] || 'v-unknown');
@@ -175,6 +299,9 @@ async function runDiagnose() {
     document.getElementById('intersectionText').textContent = r.intersection_ms
       ? `两源钟差交集：[${fmt(r.intersection_ms[0])}, ${fmt(r.intersection_ms[1])}] ms；容许偏差 ±${fmt(r.tolerance_ms,1)} ms`
       : '无有效交集。';
+    const names = {};
+    for (const s of r.sources) names[s.id] = s.name;
+    renderLinks(r, names);
   } catch (e) {
     alert('诊断请求失败：' + e.message);
   } finally {
