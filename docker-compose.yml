@@ -1,0 +1,57 @@
+# 机房校时前诊断：诊断服务 + 两台本地 NTP 时间源
+# 启动：docker compose up --build
+# 网页：http://localhost:8000
+services:
+  ntp1:
+    build:
+      context: .
+      dockerfile: source/Dockerfile
+    environment:
+      SOURCE_ID: ntp-source-1
+      UDP_PORT: "123"
+      HTTP_PORT: "9000"
+      INITIAL_OFFSET_MS: "0"      # 初始源钟差（毫秒），网页可实时调整
+      INITIAL_DELAY_MS: "20"      # 初始回包延迟（毫秒），网页可实时调整
+    ports:
+      - "10123:123/udp"           # 宿主机直测口（可选）
+      - "9001:9000"               # 控制口（可选暴露，便于调试）
+    networks: [ntpnet]
+
+  ntp2:
+    build:
+      context: .
+      dockerfile: source/Dockerfile
+    environment:
+      SOURCE_ID: ntp-source-2
+      UDP_PORT: "123"
+      HTTP_PORT: "9000"
+      INITIAL_OFFSET_MS: "0"
+      INITIAL_DELAY_MS: "20"
+    ports:
+      - "10124:123/udp"
+      - "9002:9000"
+    networks: [ntpnet]
+
+  diag:
+    build:
+      context: .
+      dockerfile: diag/Dockerfile
+    environment:
+      NTP1_NAME: ntp-source-1
+      NTP1_HOST: ntp1
+      NTP1_UDP_PORT: "123"
+      NTP1_HTTP_URL: http://ntp1:9000
+      NTP2_NAME: ntp-source-2
+      NTP2_HOST: ntp2
+      NTP2_UDP_PORT: "123"
+      NTP2_HTTP_URL: http://ntp2:9000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ntp1
+      - ntp2
+    networks: [ntpnet]
+
+networks:
+  ntpnet:
+    driver: bridge

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机房设备校时前诊断</title>
+<style>
+  :root { --border:#d0d7de; --bg:#f6f8fa; --fg:#1f2328; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; background: var(--bg); color: var(--fg); }
+  header { background:#0b3d66; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; font-weight:600; }
+  header p { margin:4px 0 0; font-size:12px; opacity:.8; }
+  main { max-width: 1080px; margin: 20px auto; padding: 0 16px 40px; }
+  section { background:#fff; border:1px solid var(--border); border-radius:8px;
+            padding:16px 20px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:760px){ .cards{grid-template-columns:1fr;} }
+  .card { border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+  .card h3 { margin:0 0 10px; font-size:14px; }
+  .card .status { font-size:12px; margin-left:8px; }
+  label { display:block; font-size:12px; color:#57606a; margin:8px 0 3px; }
+  input { width:100%; padding:6px 8px; border:1px solid var(--border);
+          border-radius:6px; font-size:14px; }
+  button { background:#0b5cad; color:#fff; border:0; border-radius:6px;
+           padding:7px 16px; font-size:14px; cursor:pointer; margin-top:10px; }
+  button:disabled { opacity:.5; cursor:wait; }
+  button.secondary { background:#57606a; }
+  .row { display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:140px; }
+  .banner { font-size:20px; font-weight:700; text-align:center; padding:14px;
+            border-radius:8px; margin-bottom:12px; }
+  .v-ok      { background:#dafbe1; color:#116329; border:1px solid #4ac26b; }
+  .v-need    { background:#ffebe9; color:#a40e26; border:1px solid #ff8182; }
+  .v-pending { background:#fff8c5; color:#7d4e00; border:1px solid #d4a72c; }
+  .v-unknown { background:#eaeef2; color:#57606a; border:1px solid #8c959f; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th, td { border:1px solid var(--border); padding:5px 8px; text-align:right;
+           font-variant-numeric:tabular-nums; }
+  th { background:var(--bg); }
+  td.l, th.l { text-align:left; }
+  .reason { font-size:13px; margin:10px 0; }
+  .muted { color:#57606a; font-size:12px; }
+  .err { color:#a40e26; font-size:13px; }
+  .hidden { display:none; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>机房设备校时前诊断</h1>
+  <p>核对诊断机相对两台内网 NTP 时间源的钟差是否在容许范围内（四时间戳 UDP 实测）</p>
+</header>
+<main>
+  <section>
+    <h2>一、时间源参数（实时生效）</h2>
+    <div class="cards" id="sourceCards"></div>
+  </section>
+
+  <section>
+    <h2>二、发起诊断</h2>
+    <div class="row">
+      <div>
+        <label for="tolerance">容许偏差（毫秒）</label>
+        <input id="tolerance" type="number" value="50" min="0.001" step="any">
+      </div>
+      <div>
+        <label for="timeout">单源探测超时（毫秒）</label>
+        <input id="timeout" type="number" value="2000" min="200" max="30000" step="100">
+      </div>
+      <div style="flex:0">
+        <button id="diagnoseBtn" onclick="runDiagnose()">发起 UDP 探测</button>
+      </div>
+    </div>
+    <p class="muted">判定规则：两源区间不相交 / 有源超时或回包异常 → 无法判断；
+      交集完全在容差内 → 无需校时；完全在容差外 → 需要校时；跨越边界 → 待核。</p>
+  </section>
+
+  <section id="resultSection" class="hidden">
+    <h2>三、诊断结果</h2>
+    <div id="verdictBanner"></div>
+    <p class="reason" id="reasonText"></p>
+    <div id="sourceTables"></div>
+    <p id="intersectionText" class="muted"></p>
+  </section>
+</main>
+
+<script>
+const VERDICT_CLASS = { no_calibration_needed:'v-ok', calibration_needed:'v-need',
+                        pending_review:'v-pending', undetermined:'v-unknown' };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let detail = r.statusText;
+    try { detail = (await r.json()).detail || detail; } catch(e) {}
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
+function fmt(x, d=3) { return (x === null || x === undefined) ? '—' : Number(x).toFixed(d); }
+function fmtTs(x) { return x ? new Date(x*1000).toLocaleTimeString('zh-CN',{hour12:false}) +
+                              '.' + String(Math.round(x*1000)%1000).padStart(3,'0') : '—'; }
+
+async function loadSources() {
+  const box = document.getElementById('sourceCards');
+  try {
+    const data = await api('/api/sources');
+    box.innerHTML = '';
+    for (const s of data.sources) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <h3>源 ${s.id}：${s.name}
+          <span class="status">${s.reachable
+            ? '<span style="color:#116329">● 在线</span> <code>udp '+s.udp+'</code>'
+            : '<span style="color:#a40e26">● 控制口不可达</span>'}</span></h3>
+        ${s.reachable ? `
+        <label>源钟差 offset（毫秒，源钟 − 真实时间）</label>
+        <input id="off${s.id}" type="number" step="any" value="${s.offset_ms}">
+        <label>回包延迟（毫秒）</label>
+        <input id="dly${s.id}" type="number" step="any" min="0" value="${s.reply_delay_ms}">
+        <button onclick="applyConfig(${s.id})">应用</button>
+        <span class="muted" id="msg${s.id}"></span>`
+        : `<p class="err">${s.error || ''}</p>`}
+      `;
+      box.appendChild(card);
+    }
+  } catch (e) {
+    box.innerHTML = `<p class="err">读取源配置失败：${e.message}</p>`;
+  }
+}
+
+async function applyConfig(id) {
+  const msg = document.getElementById('msg'+id);
+  msg.textContent = ' 应用中…';
+  try {
+    const body = { offset_ms: parseFloat(document.getElementById('off'+id).value),
+                   reply_delay_ms: parseFloat(document.getElementById('dly'+id).value) };
+    const r = await api(`/api/sources/${id}/config`,
+      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    msg.textContent = ` 已生效：offset=${fmt(r.current.offset_ms,1)} ms, delay=${fmt(r.current.reply_delay_ms,1)} ms`;
+  } catch (e) { msg.textContent = ' 失败：' + e.message; }
+}
+
+function sourceTable(s) {
+  if (!s.ok) return `<p class="err">源 ${s.id}（${s.name}）：探测失败 — ${s.error}</p>`;
+  const t = s.timestamps;
+  return `<table><tr><th class="l">源 ${s.id}：${s.name}</th>
+    <th>t1 发送</th><th>t2 源收</th><th>t3 源发</th><th>t4 本机收</th>
+    <th>钟差 θ (ms)</th><th>时延 δ (ms)</th><th>钟差区间 [θ±δ/2] (ms)</th></tr>
+    <tr><td class="l">四时间戳 / 派生量</td>
+    <td>${fmtTs(t.t1)}</td><td>${fmtTs(t.t2)}</td><td>${fmtTs(t.t3)}</td><td>${fmtTs(t.t4)}</td>
+    <td>${fmt(s.offset_ms)}</td><td>${fmt(s.delay_ms)}</td>
+    <td>[${fmt(s.interval_ms[0])}, ${fmt(s.interval_ms[1])}]</td></tr></table>`;
+}
+
+async function runDiagnose() {
+  const btn = document.getElementById('diagnoseBtn');
+  btn.disabled = true; btn.textContent = '探测中…';
+  try {
+    const body = { tolerance_ms: parseFloat(document.getElementById('tolerance').value),
+                   timeout_ms: parseInt(document.getElementById('timeout').value, 10) };
+    const r = await api('/api/diagnose',
+      { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    document.getElementById('resultSection').classList.remove('hidden');
+    const banner = document.getElementById('verdictBanner');
+    banner.className = 'banner ' + (VERDICT_CLASS[r.verdict] || 'v-unknown');
+    banner.textContent = r.verdict_text;
+    document.getElementById('reasonText').textContent = r.reason;
+    document.getElementById('sourceTables').innerHTML = r.sources.map(sourceTable).join('');
+    document.getElementById('intersectionText').textContent = r.intersection_ms
+      ? `两源钟差交集：[${fmt(r.intersection_ms[0])}, ${fmt(r.intersection_ms[1])}] ms；容许偏差 ±${fmt(r.tolerance_ms,1)} ms`
+      : '无有效交集。';
+  } catch (e) {
+    alert('诊断请求失败：' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '发起 UDP 探测';
+  }
+}
+
+loadSources();
+</script>
+</body>
+</html>
